@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "baseBranch": "auto",
+  "branchPrefix": "auto",
+  "pr": {
+    "openPr": true,
+    "draft": false,
+    "autoMerge": false,
+    "mergeMethod": "squash",
+    "deleteBranchOnMerge": true
+  }
+}
+

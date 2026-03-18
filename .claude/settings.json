@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "disableBypassPermissionsMode": "disable",
+    "ask": [
+      "Bash(git push:*)"
+    ],
+    "deny": [
+      "WebFetch(https://localhost:*)",
+      "WebFetch(http://localhost:*)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.ssh/**)",
+      "Read(~/.gnupg/**)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/ias check",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

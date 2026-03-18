@@ -1,0 +1,2292 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IAS_DIR="${ROOT_DIR}/docs/ias"
+cd "${ROOT_DIR}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/ias check
+  scripts/ias check-runner [--latest|--run <YYYYMMDD-slug>]
+  scripts/ias preflight [--fix]
+  scripts/ias init-context [--non-interactive] [--base-goal <text>|--base-goal-file <path>] [--constraint <text>...] [--constraints-file <path>] [--input <text>...] [--inputs-file <path>] [--engagement <greenfield|brownfield>] [--production] [--deployed-version-ref <ref>] [--sensitive-data <text>] [--force] [--commit] [--push] [--pr] [--pr-base <branch>] [--branch <name>] [--base <branch>]
+  scripts/ias resume [--latest|--run <YYYYMMDD-slug>]
+  scripts/ias inbox
+  scripts/ias new-run <kebab-slug>
+  scripts/ias new-decision <kebab-slug> "<Title>" [--merge-blocker]
+  scripts/ias add-gap "<Text>"
+  scripts/ias init-design
+  scripts/ias start-branch <kebab-slug> [--base <branch>] [--prefix <prefix>] [--name <branch>]
+  scripts/ias bootstrap <target-repo-path> [--profile <terminal|hybrid|control-plane|full>] [--force] [--local-only] [--commit] [--branch <name>] [--base <branch>] [--push] [--pr] [--pr-base <branch>]
+
+Notes:
+  - This tool is intentionally lightweight and repo-first.
+  - It creates auditable Markdown artifacts and keeps runs moving with mocks/stubs.
+EOF
+}
+
+IAS_UI_INITED="0"
+IAS_UI_COLOR="0"
+
+ias_ui_init() {
+  if [[ "${IAS_UI_INITED}" == "1" ]]; then
+    return 0
+  fi
+  IAS_UI_INITED="1"
+  IAS_UI_COLOR="0"
+  # Color is opt-in by default for TTY; NO_COLOR disables.
+  if [[ -t 1 && -z "${NO_COLOR+x}" ]]; then
+    IAS_UI_COLOR="1"
+  fi
+}
+
+ias_ui_style() {
+  local code="$1"
+  shift || true
+  if [[ "${IAS_UI_COLOR}" == "1" ]]; then
+    printf "\033[%sm%s\033[0m" "${code}" "$*"
+  else
+    printf "%s" "$*"
+  fi
+}
+
+ias_ui_prefix() {
+  ias_ui_style "36" "// IAS"
+}
+
+ias_ui_tag() {
+  local kind="$1"
+  case "${kind}" in
+    ok) ias_ui_style "32" "OK" ;;
+    warn) ias_ui_style "33" "WARN" ;;
+    fail) ias_ui_style "31" "FAIL" ;;
+    info) ias_ui_style "36" "INFO" ;;
+    *) printf "%s" "${kind}" ;;
+  esac
+}
+
+ias_ui_line() {
+  local kind="$1"
+  shift || true
+  local msg="$*"
+  ias_ui_init
+  printf "%s %s %s\n" "$(ias_ui_prefix)" "$(ias_ui_tag "${kind}")" "${msg}"
+}
+
+ias_ui_line_err() {
+  local kind="$1"
+  shift || true
+  local msg="$*"
+  ias_ui_init
+  printf "%s %s %s\n" "$(ias_ui_prefix)" "$(ias_ui_tag "${kind}")" "${msg}" >&2
+}
+
+ias_ui_section() {
+  local title="$*"
+  ias_ui_init
+  printf "\n%s %s\n" "$(ias_ui_prefix)" "$(ias_ui_style "2" "${title}")"
+}
+
+ias_ui_ok() { ias_ui_line ok "$*"; }
+ias_ui_warn() { ias_ui_line warn "$*"; }
+ias_ui_info() { ias_ui_line info "$*"; }
+ias_ui_fail() { ias_ui_line_err fail "$*"; }
+
+die() {
+  ias_ui_fail "$*"
+  exit 1
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+escape_sed_replacement() {
+  local value="$1"
+  # Escape characters that are special in sed replacement strings.
+  # - backslash: escape itself
+  # - ampersand: expands to the whole match
+  # - delimiter (we use |): must be escaped
+  value="${value//\\/\\\\}"
+  value="${value//&/\\&}"
+  value="${value//|/\\|}"
+  printf "%s" "${value}"
+}
+
+sync_dir_excluding() {
+  local src="$1"
+  local dest="$2"
+  shift 2 || true
+
+  if have_cmd rsync; then
+    mkdir -p "${dest}"
+    rsync -a --delete "$@" "${src%/}/" "${dest%/}/"
+    return 0
+  fi
+
+  rm -rf "${dest}"
+  mkdir -p "$(dirname "${dest}")"
+  cp -R "${src}" "${dest}"
+  # Best-effort cleanup of excluded paths (relative to dest).
+  local ex
+  for ex in "$@"; do
+    if [[ "${ex}" == --exclude=* ]]; then
+      local rel="${ex#--exclude=}"
+      rm -rf "${dest%/}/${rel}" 2>/dev/null || true
+    fi
+  done
+}
+
+search_file() {
+  local pattern="$1"
+  local file="$2"
+  if have_cmd rg; then
+    rg -n --no-filename -- "${pattern}" "${file}"
+  else
+    grep -nE "${pattern}" "${file}"
+  fi
+}
+
+search_fixed() {
+  local needle="$1"
+  local file="$2"
+  if have_cmd rg; then
+    rg -n --fixed-strings --no-filename -- "${needle}" "${file}"
+  else
+    grep -nF "${needle}" "${file}"
+  fi
+}
+
+require_kebab() {
+  local value="$1"
+  [[ "$value" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "expected kebab-case slug, got: ${value}"
+}
+
+today_ymd() {
+  date +"%Y%m%d"
+}
+
+today_iso() {
+  date +"%Y-%m-%d"
+}
+
+ensure_ias_scaffold() {
+  [[ -d "${IAS_DIR}" ]] || die "missing ${IAS_DIR}; are you in the IAS repo?"
+  [[ -f "${IAS_DIR}/project-context.md" ]] || die "missing docs/ias/project-context.md"
+  [[ -f "${IAS_DIR}/gaps.md" ]] || die "missing docs/ias/gaps.md"
+  [[ -d "${IAS_DIR}/templates" ]] || die "missing docs/ias/templates/"
+  [[ -d "${IAS_DIR}/runs" ]] || die "missing docs/ias/runs/"
+  [[ -d "${IAS_DIR}/decisions" ]] || die "missing docs/ias/decisions/"
+}
+
+is_git_repo() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+ensure_git_repo() {
+  local fix="${1:-false}"
+  if is_git_repo; then
+    return 0
+  fi
+
+  if [[ "${fix}" == "true" ]]; then
+    git init >/dev/null 2>&1 || die "failed to init git repo"
+    return 0
+  fi
+
+  die "not a git repository (run: git init, or re-run with --fix)"
+}
+
+is_client_safe_mode() {
+  local marker="# IAS (framework local-only; keep project artifacts committable)"
+  [[ -f "${ROOT_DIR}/.gitignore" ]] || return 1
+  search_fixed "${marker}" "${ROOT_DIR}/.gitignore" >/dev/null 2>&1
+}
+
+verify_ip_boundary_not_tracked() {
+  # Only enforce in client-safe mode; internal repos can commit the framework.
+  if ! is_client_safe_mode; then
+    return 0
+  fi
+
+  local tracked=()
+
+  local is_tracked_path
+  is_tracked_path() {
+    local p="$1"
+    if git ls-files -- "${p}" 2>/dev/null | head -n 1 | grep -q .; then
+      return 0
+    fi
+    if git ls-files --error-unmatch "${p}" >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  }
+
+  local path
+  for path in \
+    ".ias" \
+    ".agents" \
+    ".claude" \
+    ".codex" \
+    "scripts/ias" \
+    "scripts/ias-worker" \
+    "scripts/ias-runner" \
+    "scripts/ias-shared" \
+    "AGENTS.md" \
+    "CLAUDE.md" \
+    ".mcp.json" \
+    "docs/ias/process" \
+    "docs/ias/templates" \
+    "docs/ias/policy" \
+    "docs/ias/integrations" \
+    "docs/ias/reference" \
+    "docs/ias/README.md"; do
+    if is_tracked_path "${path}"; then
+      tracked+=("${path}")
+    fi
+  done
+
+  # Runner telemetry is local-only by default in client-safe mode.
+  if git ls-files -- "docs/ias/runs" 2>/dev/null | grep -E "/runner/" -m 1 >/dev/null 2>&1; then
+    tracked+=("docs/ias/runs/**/runner/**")
+  fi
+
+  if (( ${#tracked[@]} > 0 )); then
+    echo "FAIL: client-safe mode enabled, but framework files are tracked by git:"
+    printf "  - %s\n" "${tracked[@]}"
+    echo "Fix: remove them from the index (keep local files) and rely on .gitignore."
+    echo "  Example: git rm -r --cached .agents .claude .codex scripts/ias scripts/ias-worker scripts/ias-runner docs/ias/process docs/ias/templates docs/ias/integrations docs/ias/reference AGENTS.md CLAUDE.md .mcp.json"
+    exit 2
+  fi
+}
+
+require_non_todo_field() {
+  local label="$1"
+  local value="$2"
+  if [[ -z "${value}" || "${value}" == "TODO" || "${value}" == "TODO "* ]]; then
+    die "missing required field: ${label}"
+  fi
+}
+
+is_tty() {
+  [[ -t 0 && -t 1 ]]
+}
+
+prompt_editor_text() {
+  local title="$1"
+  local placeholder="${2:-}"
+
+  is_tty || die "${title}: missing required value (non-interactive); pass flags instead"
+  have_cmd "${EDITOR:-vi}" || true
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ias-edit.XXXXXX")"
+  {
+    echo "# ${title}"
+    echo "#"
+    echo "# Lines starting with # are ignored."
+    echo "# Save + close to continue."
+    echo ""
+    if [[ -n "${placeholder}" ]]; then
+      echo "${placeholder}"
+    fi
+  } >"${tmp}"
+
+  "${EDITOR:-vi}" "${tmp}"
+
+  local out=""
+  out="$(grep -vE '^[[:space:]]*#' "${tmp}" | sed -e 's/[[:space:]]*$//' )"
+  rm -f "${tmp}" || true
+
+  echo "${out}"
+}
+
+add_gap_line() {
+  local text="$1"
+  [[ -n "${text}" ]] || die "missing gap text"
+  local file="${IAS_DIR}/gaps.md"
+  [[ -f "${file}" ]] || die "missing ${file}"
+
+  if ! search_fixed "## Open gaps" "${file}" >/dev/null; then
+    die "docs/ias/gaps.md is missing '## Open gaps' section"
+  fi
+
+  local line="- ${text}"
+  local insert="true"
+  if search_fixed "${line}" "${file}" >/dev/null; then
+    insert="false"
+  fi
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ias-gaps.XXXXXX")"
+  awk -v newline="${line}" -v insert="${insert}" '
+    function flush_section() {
+      # Count bullet lines other than (none).
+      real=0
+      for (i=1; i<=n; i++) {
+        if (section[i] ~ /^- / && section[i] != "- (none)") real=1
+      }
+      if (!real) {
+        print "- (none)"
+        return
+      }
+      for (i=1; i<=n; i++) {
+        if (section[i] == "- (none)") continue
+        if (section[i] == "") continue
+        print section[i]
+      }
+    }
+    BEGIN {in_section=0; n=0; saw_new=0}
+    /^## Open gaps/ {
+      in_section=1
+      print
+      next
+    }
+    in_section && /^## / {
+      if (insert == "true" && !saw_new) { section[++n]=newline; saw_new=1 }
+      flush_section()
+      in_section=0
+      n=0
+      print
+      next
+    }
+    in_section {
+      if ($0 == newline) saw_new=1
+      if ($0 ~ /^[[:space:]]*$/) next
+      section[++n]=$0
+      next
+    }
+    { print }
+    END {
+      if (in_section) {
+        if (insert == "true" && !saw_new) { section[++n]=newline; saw_new=1 }
+        flush_section()
+      }
+    }
+  ' "${file}" >"${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+cmd_preflight() {
+  ias_ui_section "Preflight"
+  local fix="false"
+  if [[ "${1:-}" == "--fix" ]]; then
+    fix="true"
+  elif [[ -n "${1:-}" ]]; then
+    die "unknown flag: ${1}"
+  fi
+
+  have_cmd git || die "git not found"
+  ensure_git_repo "${fix}"
+
+  ensure_ias_scaffold
+  verify_ip_boundary_not_tracked
+
+  # Hybrid runner dependencies (optional but recommended).
+  # We fail fast here because unattended runs depend on the SDK runner working.
+  if [[ -f "scripts/ias-runner/package.json" ]]; then
+    have_cmd node || die "node not found (required for the hybrid runner)"
+    have_cmd npm || die "npm not found (required for the hybrid runner)"
+    if [[ ! -d "scripts/ias-runner/node_modules/@openai/codex-sdk" ]]; then
+      if [[ "${fix}" == "true" ]]; then
+        ias_ui_info "Installing hybrid runner dependencies (scripts/ias-runner)..."
+        (
+          cd scripts/ias-runner \
+            && if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
+        ) || die "failed to install hybrid runner dependencies (scripts/ias-runner)"
+      else
+        die "hybrid runner deps missing: run (cd scripts/ias-runner && npm ci) or rerun: ./scripts/ias preflight --fix"
+      fi
+    fi
+  fi
+
+  # Minimal human-provided context required to run safely.
+  local production deployed_ref sensitive_data engagement_type
+  production="$(extract_frontmatter_field "production" "${IAS_DIR}/project-context.md")"
+  require_non_todo_field "docs/ias/project-context.md: production" "${production}"
+  if [[ "${production}" != "true" && "${production}" != "false" ]]; then
+    die "docs/ias/project-context.md: production must be true|false"
+  fi
+
+  engagement_type="$(extract_frontmatter_field "engagement_type" "${IAS_DIR}/project-context.md")"
+
+  deployed_ref="$(extract_frontmatter_field "deployed_version_ref" "${IAS_DIR}/project-context.md")"
+  if [[ "${production}" == "true" ]]; then
+    require_non_todo_field "docs/ias/project-context.md: deployed_version_ref (required when production: true)" "${deployed_ref}"
+    if [[ "${deployed_ref}" == "n/a" ]]; then
+      die "docs/ias/project-context.md: deployed_version_ref must not be n/a when production: true"
+    fi
+  fi
+
+  sensitive_data="$(extract_frontmatter_field "sensitive_data" "${IAS_DIR}/project-context.md")"
+  require_non_todo_field "docs/ias/project-context.md: sensitive_data" "${sensitive_data}"
+
+  if ! has_non_todo_bullet_in_section "${IAS_DIR}/project-context.md" "^## Non-negotiable constraints"; then
+    die "docs/ias/project-context.md: add at least one non-TODO hard constraint under '## Non-negotiable constraints (hard constraints)'"
+  fi
+
+  # Ensure Context Pack exists.
+  [[ -f "${IAS_DIR}/context/base-goal.md" ]] || die "missing docs/ias/context/base-goal.md"
+  [[ -f "${IAS_DIR}/context/inputs.md" ]] || die "missing docs/ias/context/inputs.md"
+  local goal_line
+  goal_line="$(
+    if have_cmd rg; then
+      rg -n --no-filename "^TODO$" "${IAS_DIR}/context/base-goal.md" | head -n 1 || true
+    else
+      grep -nE "^TODO$" "${IAS_DIR}/context/base-goal.md" | head -n 1 || true
+    fi
+  )"
+  if [[ -n "${goal_line}" ]]; then
+    die "docs/ias/context/base-goal.md is still TODO"
+  fi
+
+  if [[ "${production}" == "true" || "${engagement_type}" == "brownfield" ]]; then
+    if ! has_non_todo_bullet_anywhere "${IAS_DIR}/context/inputs.md"; then
+      die "docs/ias/context/inputs.md is required for production/brownfield runs; add at least one non-TODO bullet (links/notes)"
+    fi
+  else
+    if search_fixed "- TODO" "${IAS_DIR}/context/inputs.md" >/dev/null 2>&1; then
+      ias_ui_warn "docs/ias/context/inputs.md still contains TODOs (recommended: add links/notes)."
+    fi
+  fi
+
+  ias_ui_ok "preflight passed."
+  if is_client_safe_mode; then
+    ias_ui_info "client-safe mode detected (framework gitignored; artifacts committable)."
+  fi
+}
+
+replace_first_line_matching() {
+  local file="$1"
+  local re="$2"
+  local replacement="$3"
+  [[ -f "${file}" ]] || die "missing file: ${file}"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ias-replace.XXXXXX")"
+  awk -v re="${re}" -v repl="${replacement}" '
+    BEGIN {done=0}
+    {
+      if (!done && $0 ~ re) {
+        print repl
+        done=1
+        next
+      }
+      print
+    }
+  ' "${file}" >"${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+replace_markdown_section_bullets() {
+  local file="$1"
+  local header_re="$2"
+  shift 2 || true
+  local bullets=("$@")
+  [[ -f "${file}" ]] || die "missing file: ${file}"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ias-section.XXXXXX")"
+  awk -v header_re="${header_re}" -v bullets_text="$(printf "%s\n" "${bullets[@]}")" '
+    function print_bullets() {
+      if (bullets_text == "") {
+        print "- (none)"
+        return
+      }
+      n = split(bullets_text, arr, "\n")
+      for (i=1; i<=n; i++) {
+        line=arr[i]
+        gsub(/^[[:space:]]+/, "", line)
+        gsub(/[[:space:]]+$/, "", line)
+        if (line == "") continue
+        # Normalize optional leading dash.
+        if (line ~ /^- /) {
+          print line
+        } else {
+          print "- " line
+        }
+      }
+    }
+
+    BEGIN {in_section=0; replaced=0}
+    $0 ~ header_re {
+      in_section=1
+      replaced=1
+      print
+      print ""
+      print_bullets()
+      next
+    }
+    in_section && $0 ~ /^## / {
+      in_section=0
+      print
+      next
+    }
+    in_section {
+      # Skip old section content.
+      next
+    }
+    { print }
+    END {
+      if (!replaced) {
+        # No-op; header not found.
+      }
+    }
+  ' "${file}" >"${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+cmd_init_context() {
+  ensure_ias_scaffold
+
+  local non_interactive="false"
+  local base_goal=""
+  local base_goal_file=""
+
+  local engagement_type="greenfield"
+  local production="false"
+  local deployed_version_ref=""
+  local sensitive_data="none"
+
+  local force="false"
+  local commit="false"
+  local push="false"
+  local open_pr="false"
+  local pr_base=""
+  local base_branch="main"
+  local branch_name="ias/context"
+
+  local constraints=()
+  local inputs=()
+  local constraints_file=""
+  local inputs_file=""
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --non-interactive) non_interactive="true"; shift ;;
+      --base-goal) base_goal="${2:-}"; shift 2 ;;
+      --base-goal-file) base_goal_file="${2:-}"; shift 2 ;;
+      --constraint) constraints+=("${2:-}"); shift 2 ;;
+      --constraints-file) constraints_file="${2:-}"; shift 2 ;;
+      --input) inputs+=("${2:-}"); shift 2 ;;
+      --inputs-file) inputs_file="${2:-}"; shift 2 ;;
+      --engagement) engagement_type="${2:-}"; shift 2 ;;
+      --production) production="true"; shift ;;
+      --deployed-version-ref) deployed_version_ref="${2:-}"; shift 2 ;;
+      --sensitive-data) sensitive_data="${2:-}"; shift 2 ;;
+      --force) force="true"; shift ;;
+      --commit) commit="true"; shift ;;
+      --push) push="true"; commit="true"; shift ;;
+      --pr) open_pr="true"; push="true"; commit="true"; shift ;;
+      --pr-base) pr_base="${2:-}"; shift 2 ;;
+      --branch) branch_name="${2:-}"; shift 2 ;;
+      --base) base_branch="${2:-}"; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown flag: ${1}" ;;
+    esac
+  done
+
+  if [[ -n "${base_goal_file}" ]]; then
+    [[ -f "${base_goal_file}" ]] || die "base-goal file not found: ${base_goal_file}"
+    base_goal="$(cat "${base_goal_file}")"
+  fi
+
+  if [[ -n "${constraints_file}" ]]; then
+    [[ -f "${constraints_file}" ]] || die "constraints file not found: ${constraints_file}"
+    while IFS= read -r line; do
+      line="$(echo "${line}" | sed 's/[[:space:]]*$//')"
+      [[ -n "${line}" ]] || continue
+      constraints+=("${line}")
+    done <"${constraints_file}"
+  fi
+
+  if [[ -n "${inputs_file}" ]]; then
+    [[ -f "${inputs_file}" ]] || die "inputs file not found: ${inputs_file}"
+    while IFS= read -r line; do
+      line="$(echo "${line}" | sed 's/[[:space:]]*$//')"
+      [[ -n "${line}" ]] || continue
+      inputs+=("${line}")
+    done <"${inputs_file}"
+  fi
+
+  case "${engagement_type}" in
+    ""|greenfield|brownfield) ;;
+    *) die "invalid --engagement (expected greenfield|brownfield), got: ${engagement_type}" ;;
+  esac
+
+  if [[ -z "${base_goal//[[:space:]]/}" ]]; then
+    if [[ "${non_interactive}" == "true" ]]; then
+      die "missing required value: --base-goal or --base-goal-file"
+    fi
+    base_goal="$(prompt_editor_text "Base goal (single outcome statement)" "TODO")"
+  fi
+
+  # Normalize goal into a single line for the canonical file.
+  local goal_one_line=""
+  goal_one_line="$(echo "${base_goal}" | tr '\n' ' ' | awk '{$1=$1}1' | sed 's/[[:space:]]*$//')"
+  [[ -n "${goal_one_line}" ]] || die "base goal is empty"
+
+  if (( ${#constraints[@]} == 0 )); then
+    if [[ "${non_interactive}" == "true" ]]; then
+      die "missing required value: at least one --constraint (or --constraints-file)"
+    fi
+    local edited_constraints=""
+    edited_constraints="$(prompt_editor_text "Hard constraints (one per line)" "- No secrets in git\n- Must be safe for production\n")"
+    while IFS= read -r line; do
+      line="$(echo "${line}" | sed 's/^[[:space:]]*- *//' | sed 's/[[:space:]]*$//')"
+      [[ -n "${line}" ]] || continue
+      constraints+=("${line}")
+    done <<<"${edited_constraints}"
+  fi
+  (( ${#constraints[@]} > 0 )) || die "at least one hard constraint is required"
+
+  if [[ "${production}" == "true" ]]; then
+    if [[ -z "${deployed_version_ref//[[:space:]]/}" ]]; then
+      if [[ "${non_interactive}" == "true" ]]; then
+        die "missing required value: --deployed-version-ref (required when --production)"
+      fi
+      deployed_version_ref="$(prompt_editor_text "Deployed version ref (commit SHA, tag, release)" "")"
+    fi
+    deployed_version_ref="$(echo "${deployed_version_ref}" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')"
+    [[ -n "${deployed_version_ref}" ]] || die "deployed version ref is empty"
+    [[ "${deployed_version_ref}" != "n/a" ]] || die "deployed version ref must not be n/a when production"
+  fi
+
+  if [[ "${production}" == "true" || "${engagement_type}" == "brownfield" ]]; then
+    if (( ${#inputs[@]} == 0 )); then
+      if [[ "${non_interactive}" == "true" ]]; then
+        die "missing required value: at least one --input (or --inputs-file) for production/brownfield"
+      fi
+      local edited_inputs=""
+      edited_inputs="$(prompt_editor_text "Inputs (links/notes; one per line)" "")"
+      while IFS= read -r line; do
+        line="$(echo "${line}" | sed 's/^[[:space:]]*- *//' | sed 's/[[:space:]]*$//')"
+        [[ -n "${line}" ]] || continue
+        inputs+=("${line}")
+      done <<<"${edited_inputs}"
+    fi
+    (( ${#inputs[@]} > 0 )) || die "at least one input is required for production/brownfield"
+  fi
+
+  sensitive_data="$(echo "${sensitive_data}" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')"
+  [[ -n "${sensitive_data}" ]] || sensitive_data="none"
+
+  # Apply deterministic edits.
+  local base_goal_path="${IAS_DIR}/context/base-goal.md"
+  local goal_has_todo="false"
+  if search_fixed "^TODO$" "${base_goal_path}" >/dev/null 2>&1; then
+    goal_has_todo="true"
+  fi
+
+  if [[ "${goal_has_todo}" == "true" ]]; then
+    replace_first_line_matching "${base_goal_path}" "^TODO[[:space:]]*$" "${goal_one_line}"
+  elif [[ "${force}" == "true" ]]; then
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/ias-base-goal.XXXXXX")"
+    awk -v goal="${goal_one_line}" '
+      BEGIN {in_goal=0; done=0}
+      /^##[[:space:]]+Goal[[:space:]]*$/ {in_goal=1; print; next}
+      in_goal && !done {
+        if ($0 ~ /^## /) { in_goal=0; print; next }
+        if ($0 ~ /^[[:space:]]*$/) { print; next }
+        print goal
+        done=1
+        next
+      }
+      { print }
+    ' "${base_goal_path}" >"${tmp}"
+    mv "${tmp}" "${base_goal_path}"
+  else
+    echo "note: base goal is already set; use --force to overwrite docs/ias/context/base-goal.md"
+  fi
+
+  local project_context_path="${IAS_DIR}/project-context.md"
+  replace_first_line_matching "${project_context_path}" "^- production:[[:space:]]" "- production: ${production}"
+  replace_first_line_matching "${project_context_path}" "^- engagement_type:[[:space:]]" "- engagement_type: ${engagement_type}"
+  replace_first_line_matching "${project_context_path}" "^- sensitive_data:[[:space:]]" "- sensitive_data: ${sensitive_data}"
+  if [[ "${production}" == "true" ]]; then
+    replace_first_line_matching "${project_context_path}" "^- deployed_version_ref:[[:space:]]" "- deployed_version_ref: ${deployed_version_ref}"
+  fi
+
+  if has_non_todo_bullet_in_section "${project_context_path}" "^## Non-negotiable constraints" && [[ "${force}" != "true" ]]; then
+    echo "note: hard constraints are already present; use --force to replace them."
+  else
+    replace_markdown_section_bullets "${project_context_path}" "^## Non-negotiable constraints" "${constraints[@]}"
+  fi
+
+  local inputs_path="${IAS_DIR}/context/inputs.md"
+  if (( ${#inputs[@]} > 0 )); then
+    if has_non_todo_bullet_in_section "${inputs_path}" "^## External links" && [[ "${force}" != "true" ]]; then
+      echo "note: inputs already present in docs/ias/context/inputs.md; use --force to replace them."
+    else
+      replace_markdown_section_bullets "${inputs_path}" "^## External links" "${inputs[@]}"
+    fi
+  fi
+
+  echo "OK: initialized repo context files:"
+  echo "  - ${base_goal_path}"
+  echo "  - ${project_context_path}"
+  echo "  - ${inputs_path}"
+
+  if [[ "${commit}" == "true" || "${push}" == "true" || "${open_pr}" == "true" ]]; then
+    have_cmd git || die "git not found"
+    ensure_git_repo "false"
+
+    local current_branch=""
+    current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+    if [[ "${current_branch}" == "HEAD" || "${current_branch}" == "${base_branch}" ]]; then
+      if git show-ref --verify --quiet "refs/heads/${branch_name}"; then
+        if [[ "${force}" == "true" ]]; then
+          git checkout -B "${branch_name}" "${base_branch}" >/dev/null || die "failed to reset branch ${branch_name}"
+        else
+          die "branch already exists: ${branch_name} (checkout it, or re-run with --force)"
+        fi
+      else
+        git checkout -b "${branch_name}" "${base_branch}" >/dev/null || die "failed to create branch ${branch_name} from ${base_branch}"
+      fi
+    fi
+
+    git add -A -- "docs/ias/context/base-goal.md" "docs/ias/project-context.md" "docs/ias/context/inputs.md"
+    if git diff --cached --quiet; then
+      echo "note: no changes to commit."
+    else
+      git commit -m "Initialize repo context" >/dev/null || die "git commit failed"
+      echo "Committed repo context changes on branch: $(git rev-parse --abbrev-ref HEAD)"
+    fi
+
+    if [[ "${push}" == "true" ]]; then
+      git remote get-url origin >/dev/null 2>&1 || die "missing git remote 'origin' (required for --push/--pr)"
+      git push -u origin HEAD >/dev/null || die "git push failed"
+      echo "Pushed branch to origin."
+    fi
+
+    if [[ "${open_pr}" == "true" ]]; then
+      have_cmd gh || die "GitHub CLI not found (install: https://cli.github.com/)"
+      [[ -n "${pr_base}" ]] || pr_base="${base_branch}"
+
+      local pr_base_ref="${pr_base}"
+      if git show-ref --verify --quiet "refs/remotes/origin/${pr_base}"; then
+        pr_base_ref="origin/${pr_base}"
+      fi
+      local ahead_count="0"
+      ahead_count="$(git rev-list --count "${pr_base_ref}..HEAD" 2>/dev/null || echo "0")"
+      if [[ "${ahead_count}" == "0" ]]; then
+        echo "note: no commits between ${pr_base_ref} and $(git rev-parse --abbrev-ref HEAD); skipping PR creation."
+        return 0
+      fi
+
+      local pr_url=""
+      local pr_create_out=""
+      pr_create_out="$(gh pr create --fill --base "${pr_base}" 2>&1)" || true
+
+      if [[ -n "${pr_create_out}" ]]; then
+        pr_url="$(echo "${pr_create_out}" | grep -Eo 'https?://[^[:space:]]+' | head -n 1 | tr -d '\r' | xargs || true)"
+      fi
+
+      if [[ -z "${pr_url}" ]]; then
+        pr_url="$(gh pr view --json url --jq '.url' 2>/dev/null || true)"
+        pr_url="$(echo "${pr_url}" | head -n 1 | tr -d '\r' | xargs)"
+      fi
+
+      if [[ -n "${pr_url}" ]]; then
+        if echo "${pr_create_out}" | grep -qi 'already exists'; then
+          echo "note: PR already exists: ${pr_url}"
+        else
+          echo "Opened PR: ${pr_url}"
+        fi
+      else
+        [[ -n "${pr_create_out}" ]] && echo "${pr_create_out}" >&2
+        die "failed to create PR via gh"
+      fi
+    fi
+  fi
+}
+
+has_non_todo_bullet_anywhere() {
+  local file="$1"
+  [[ -f "${file}" ]] || return 1
+  awk '
+    BEGIN {ok=0}
+    /^- / {
+      line=$0
+      sub(/^[[:space:]]*- /, "", line)
+      gsub(/[[:space:]]+$/, "", line)
+      if (line != "" && line != "TODO" && line !~ /^TODO[[:space:]]/ && line != "(none)") ok=1
+    }
+    END { exit(ok ? 0 : 1) }
+  ' "${file}"
+}
+
+has_non_todo_bullet_in_section() {
+  local file="$1"
+  local header_re="$2"
+  [[ -f "${file}" ]] || return 1
+
+  awk -v header_re="${header_re}" '
+    BEGIN {in_section=0; ok=0}
+    $0 ~ header_re {in_section=1; next}
+    in_section && $0 ~ /^## / {in_section=0}
+    in_section && $0 ~ /^- / {
+      line=$0
+      sub(/^[[:space:]]*- /, "", line)
+      gsub(/[[:space:]]+$/, "", line)
+      if (line != "" && line != "TODO" && line !~ /^TODO[[:space:]]/ && line != "(none)") ok=1
+    }
+    END { exit(ok ? 0 : 1) }
+  ' "${file}"
+}
+
+cmd_check() {
+  ias_ui_section "Check"
+  ensure_ias_scaffold
+  verify_ip_boundary_not_tracked
+
+  local pending_merge_blockers
+  pending_merge_blockers="$(
+    find "${IAS_DIR}/decisions" -maxdepth 1 -type f -name "*.md" -print0 \
+      | xargs -0 -I{} bash -c '
+          file="{}"
+          status="$(
+            if command -v rg >/dev/null 2>&1; then rg -n --no-filename "^- status: " "$file"; else grep -nE "^- status: " "$file" || true; fi \
+              | head -n 1 | sed "s/^- status: //"
+          )"
+          blocker="$(
+            if command -v rg >/dev/null 2>&1; then rg -n --no-filename "^- merge_blocker: " "$file"; else grep -nE "^- merge_blocker: " "$file" || true; fi \
+              | head -n 1 | sed "s/^- merge_blocker: //"
+          )"
+          if [[ "$status" == "pending" && "$blocker" == "true" ]]; then
+            echo "$file"
+          fi
+        ' 2>/dev/null || true
+  )"
+
+  if [[ -n "${pending_merge_blockers}" ]]; then
+    ias_ui_fail "pending merge blockers found:"
+    echo "${pending_merge_blockers}" | sed 's/^/  - /' >&2
+    exit 2
+  fi
+
+  ias_ui_ok "IAS scaffold present; no pending merge blockers."
+}
+
+cmd_check_runner() {
+  ensure_ias_scaffold
+  local runner="${ROOT_DIR}/scripts/ias-runner/run.mjs"
+  if [[ ! -f "${runner}" ]]; then
+    die "missing ${runner} (hybrid runner not installed; re-bootstrap with: ./scripts/ias bootstrap <repo> --profile hybrid)"
+  fi
+  have_cmd node || die "node not found (required for runner checks)"
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    echo "Usage: scripts/ias check-runner [--latest|--run <YYYYMMDD-slug>]"
+    return 0
+  fi
+  if [[ $# -eq 0 ]]; then
+    # Common case: repo has IAS installed but no runs yet.
+    if ! find "${IAS_DIR}/runs" -maxdepth 1 -type d -name "20[0-9][0-9][0-9][0-9][0-9][0-9]-*" -print -quit | grep -q .; then
+      echo "OK: no runs found under docs/ias/runs; skipping runner check."
+      return 0
+    fi
+    node "${runner}" check --latest
+  else
+    node "${runner}" check "$@"
+  fi
+}
+
+extract_frontmatter_field() {
+  local field="$1"
+  local file="$2"
+  if have_cmd rg; then
+    rg --no-line-number --no-filename -- "^- ${field}: " "${file}" | head -n 1 | sed "s/^- ${field}: //" | tr -d '\r' | sed 's/[[:space:]]*$//'
+  else
+    grep -nE "^- ${field}: " "${file}" | head -n 1 | sed "s/^- ${field}: //" | tr -d '\r' | sed 's/[[:space:]]*$//'
+  fi
+}
+
+list_pending_decisions() {
+  ensure_ias_scaffold
+
+  local file status
+  while IFS= read -r -d '' file; do
+    status="$(extract_frontmatter_field "status" "${file}")"
+    [[ "${status}" == "pending" ]] || continue
+    echo "${file}"
+  done < <(find "${IAS_DIR}/decisions" -maxdepth 1 -type f -name "*.md" -print0 2>/dev/null || true)
+}
+
+cmd_inbox() {
+  ensure_ias_scaffold
+
+  local pending blockers nonblockers
+  pending="$(list_pending_decisions || true)"
+
+  if [[ -z "${pending}" ]]; then
+    echo "Decisions: none pending."
+  else
+    blockers="$(
+      while IFS= read -r file; do
+        [[ -n "${file}" ]] || continue
+        if [[ "$(extract_frontmatter_field "merge_blocker" "${file}")" == "true" ]]; then
+          echo "${file}"
+        fi
+      done <<<"${pending}"
+    )"
+
+    nonblockers="$(
+      while IFS= read -r file; do
+        [[ -n "${file}" ]] || continue
+        if [[ "$(extract_frontmatter_field "merge_blocker" "${file}")" != "true" ]]; then
+          echo "${file}"
+        fi
+      done <<<"${pending}"
+    )"
+
+    if [[ -n "${blockers}" ]]; then
+      echo "Decisions (pending, merge blockers):"
+      echo "${blockers}" | sed 's/^/  - /'
+    else
+      echo "Decisions (pending, merge blockers): none"
+    fi
+
+    if [[ -n "${nonblockers}" ]]; then
+      echo "Decisions (pending, non-blocking):"
+      echo "${nonblockers}" | sed 's/^/  - /'
+    else
+      echo "Decisions (pending, non-blocking): none"
+    fi
+  fi
+
+  if search_file "^## Open gaps" "${IAS_DIR}/gaps.md" >/dev/null; then
+    echo "Gaps (open):"
+    # Print bullet lines under "## Open gaps" until the next header.
+    awk '
+      $0 ~ /^## Open gaps/ {in_section=1; next}
+      in_section && $0 ~ /^## / {exit}
+      in_section && $0 ~ /^- / {print "  " $0}
+    ' "${IAS_DIR}/gaps.md"
+  else
+    echo "Gaps: docs/ias/gaps.md missing '## Open gaps' section"
+  fi
+}
+
+latest_run_dir() {
+  ensure_ias_scaffold
+  local dirs=()
+  local d
+  while IFS= read -r d; do
+    [[ -n "${d}" ]] || continue
+    dirs+=("${d}")
+  done < <(
+    find "${IAS_DIR}/runs" -maxdepth 1 -type d -name "20[0-9][0-9][0-9][0-9][0-9][0-9]-*" -print 2>/dev/null | sort
+  )
+
+  (( ${#dirs[@]} > 0 )) || die "no runs found under docs/ias/runs"
+
+  local best=""
+  local best_ts="-1"
+
+  local git_dir
+  git_dir="$(git rev-parse --git-dir 2>/dev/null || echo ".git")"
+
+  local ts=""
+  for d in "${dirs[@]}"; do
+    ts=""
+    # Prefer the runner state file timestamp since it moves forward as jobs run.
+    # Transient runner state lives under .git/ias/runs/<run>/runner/.
+    local candidate
+    for candidate in "${git_dir}/ias/runs/$(basename "${d}")/runner/state.json" "${d}/run-state.md" "${d}"; do
+      [[ -e "${candidate}" ]] || continue
+      if stat -f "%m" "${candidate}" >/dev/null 2>&1; then
+        ts="$(stat -f "%m" "${candidate}")"
+      else
+        ts="$(stat -c "%Y" "${candidate}" 2>/dev/null || true)"
+      fi
+      [[ -n "${ts}" ]] || continue
+      break
+    done
+
+    [[ -n "${ts}" ]] || continue
+    if (( ts > best_ts )); then
+      best_ts="${ts}"
+      best="${d}"
+    fi
+  done
+
+  [[ -n "${best}" ]] || die "no valid runs found under docs/ias/runs"
+  echo "${best}"
+}
+
+cmd_resume() {
+  ensure_ias_scaffold
+
+  local mode="${1:-}"
+  local run_ref=""
+
+  if [[ -z "${mode}" || "${mode}" == "--latest" ]]; then
+    run_ref="$(latest_run_dir)"
+  elif [[ "${mode}" == "--run" ]]; then
+    run_ref="${2:-}"
+    [[ -n "${run_ref}" ]] || die "missing run ref after --run (expected YYYYMMDD-slug)"
+    run_ref="${IAS_DIR}/runs/${run_ref}"
+    [[ -d "${run_ref}" ]] || die "run not found: ${run_ref}"
+  else
+    die "unknown flag: ${mode}"
+  fi
+
+  local run_name
+  run_name="$(basename "${run_ref}")"
+  local run_log="${IAS_DIR}/runs/${run_name}.md"
+
+  echo "Re-entry packet (read in order):"
+  echo "  1) docs/ias/project-context.md"
+  echo "  2) docs/ias/context/base-goal.md"
+  echo "  3) docs/ias/context/inputs.md"
+  echo "  4) ${run_log}"
+  echo "  5) docs/ias/runs/${run_name}/implementation-plan.md"
+  echo "  6) docs/ias/runs/${run_name}/run-state.md"
+  echo "  7) docs/ias/gaps.md + docs/ias/decisions/"
+  echo "  8) (if user-facing) docs/ias/design/ + ui snapshots plan/output"
+  echo ""
+
+  if have_cmd git && is_git_repo; then
+    echo "Git:"
+    echo "  branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
+    echo "  status:"
+    git status --porcelain | sed 's/^/    /' || true
+    echo "  recent commits:"
+    git log --oneline -10 | sed 's/^/    /' || true
+    echo ""
+  fi
+
+  cmd_inbox
+}
+
+cmd_new_run() {
+  ias_ui_section "New run"
+  ensure_ias_scaffold
+
+  local slug="${1:-}"
+  [[ -n "${slug}" ]] || die "missing run slug"
+  require_kebab "${slug}"
+
+  local ymd
+  ymd="$(today_ymd)"
+
+  local run_dir="${IAS_DIR}/runs/${ymd}-${slug}"
+  local run_log="${IAS_DIR}/runs/${ymd}-${slug}.md"
+
+  [[ -e "${run_log}" ]] && die "run log already exists: ${run_log}"
+  [[ -e "${run_dir}" ]] && die "run dir already exists: ${run_dir}"
+
+  mkdir -p "${run_dir}"
+
+  local iso
+  iso="$(today_iso)"
+
+  sed \
+    -e "s/<short name>/${slug}/g" \
+    -e "s/YYYY-MM-DD/${iso}/g" \
+    -e "s/YYYYMMDD-<run-name>/${ymd}-${slug}/g" \
+    "${IAS_DIR}/templates/run-log.md" >"${run_log}"
+
+  cp "${IAS_DIR}/templates/intake.md" "${run_dir}/intake.md"
+  cp "${IAS_DIR}/templates/implementation-plan.md" "${run_dir}/implementation-plan.md"
+  cp "${IAS_DIR}/templates/acceptance-criteria.md" "${run_dir}/acceptance-criteria.md"
+  cp "${IAS_DIR}/templates/world-model.md" "${run_dir}/world-model.md"
+  cp "${IAS_DIR}/templates/constraints-taxonomy.md" "${run_dir}/constraints-taxonomy.md"
+  cp "${IAS_DIR}/templates/run-plan.md" "${run_dir}/run-plan.md"
+  cp "${IAS_DIR}/templates/work-allocation.md" "${run_dir}/work-allocation.md"
+  cp "${IAS_DIR}/templates/research-notes.md" "${run_dir}/research-notes.md"
+  cp "${IAS_DIR}/templates/context-audit.md" "${run_dir}/context-audit.md"
+  cp "${IAS_DIR}/templates/ui-snapshot-plan.md" "${run_dir}/ui-snapshot-plan.md"
+  mkdir -p "${run_dir}/screenshots"
+  printf "*\n!.gitignore\n" >"${run_dir}/screenshots/.gitignore"
+  cp "${IAS_DIR}/templates/run-state.md" "${run_dir}/run-state.md"
+  cp "${IAS_DIR}/templates/persona-passes.md" "${run_dir}/persona-passes.md"
+  cp "${IAS_DIR}/templates/review-checklist.md" "${run_dir}/review-checklist.md"
+
+  # Hybrid runner scaffold (optional). Only create it when the runner is installed.
+  # Transient runner state lives under .git/ias/runs/<run>/runner/ (not in docs/).
+  if [[ -f "${ROOT_DIR}/scripts/ias-runner/run.mjs" ]]; then
+    local git_dir
+    git_dir="$(git rev-parse --git-dir 2>/dev/null || echo ".git")"
+    local runner_dir="${git_dir}/ias/runs/$(basename "${run_dir}")/runner"
+    mkdir -p "${runner_dir}/queue/pending" "${runner_dir}/queue/running" "${runner_dir}/queue/done" "${runner_dir}/queue/failed" "${runner_dir}/jobs"
+
+    if [[ ! -f "${runner_dir}/config.json" ]]; then
+      cat >"${runner_dir}/config.json" <<'EOF'
+{
+  "model": "gpt-5.2",
+  "modelFallbacks": ["gpt-5.1"],
+  "idleSleepMs": 5000,
+  "maxTurnMs": 1800000,
+  "retry": {
+    "enabled": true,
+    "maxAttempts": 3,
+    "backoffMs": 15000
+  },
+  "defaults": {
+    "approvalPolicy": "never"
+  },
+  "git": {
+    "enabled": true,
+    "commitCadence": "job",
+    "autoCommit": true,
+    "autoPush": true,
+    "pushMode": "always",
+    "branch": {
+      "ensure": true,
+      "base": "main",
+      "prefix": "ias/"
+    },
+    "pr": {
+      "auto": true,
+      "draft": true,
+      "base": "main",
+      "mode": "chain",
+      "chain": {
+        "rotateAfterWriteJobs": 5
+      },
+      "review": {
+        "auto": true,
+        "role": "reviewer",
+        "loop": {
+          "enabled": true,
+          "maxCycles": 3,
+          "fixRole": "implementer"
+        }
+      },
+      "merge": {
+        "auto": true,
+        "method": "merge",
+        "waitForChecks": true,
+        "deleteBranch": false,
+        "requireApprovedReview": true
+      }
+    },
+    "verifyCommands": []
+  },
+  "reentry": {
+    "maxFileBytes": 24000,
+    "maxTotalBytes": 120000
+  },
+  "recovery": {
+    "requeueRunningAfterMs": 900000
+  },
+  "checks": {
+    "runStateRequiredAfterWriteJob": true,
+    "runStateSkewMs": 2000
+  }
+}
+EOF
+    fi
+
+    if [[ ! -f "${runner_dir}/state.json" ]]; then
+      cat >"${runner_dir}/state.json" <<EOF
+{
+  "lastUpdated": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "lastThreadId": null,
+  "lastJobId": null
+}
+EOF
+    fi
+  fi
+
+  ias_ui_ok "Created run: ${ymd}-${slug}"
+  echo "  ${run_log}"
+  echo "  ${run_dir}/"
+}
+
+cmd_init_design() {
+  ensure_ias_scaffold
+
+  local design_dir="${IAS_DIR}/design"
+  local assets_dir="${design_dir}/assets"
+
+  mkdir -p "${assets_dir}"
+  # Default: keep screenshots local; allow force-add when needed.
+  printf "*\n!.gitignore\n" >"${assets_dir}/.gitignore"
+
+  [[ -f "${design_dir}/README.md" ]] || cp "${IAS_DIR}/design/README.md" "${design_dir}/README.md"
+  [[ -f "${design_dir}/brief.md" ]] || cp "${IAS_DIR}/templates/design-brief.md" "${design_dir}/brief.md"
+  [[ -f "${design_dir}/system.md" ]] || cp "${IAS_DIR}/templates/design-system.md" "${design_dir}/system.md"
+  [[ -f "${design_dir}/flows.md" ]] || cp "${IAS_DIR}/templates/design-flows.md" "${design_dir}/flows.md"
+  [[ -f "${design_dir}/screens.md" ]] || cp "${IAS_DIR}/templates/design-screens.md" "${design_dir}/screens.md"
+
+  echo "Initialized design package in:"
+  echo "  ${design_dir}/"
+}
+
+cmd_start_branch() {
+  local slug="${1:-}"
+  shift || true
+  [[ -n "${slug}" ]] || die "missing branch slug"
+  require_kebab "${slug}"
+
+  local base=""
+  local prefix=""
+  local name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --base)
+        shift || true
+        base="${1:-}"
+        [[ -n "${base}" ]] || die "missing base branch name after --base"
+        ;;
+      --prefix)
+        shift || true
+        prefix="${1:-}"
+        [[ -n "${prefix}" ]] || die "missing prefix after --prefix"
+        ;;
+      --name)
+        shift || true
+        name="${1:-}"
+        [[ -n "${name}" ]] || die "missing branch name after --name"
+        ;;
+      *) die "unknown flag: ${1}" ;;
+    esac
+    shift || true
+  done
+
+  if ! have_cmd git; then
+    die "git not found"
+  fi
+
+  # Allow untracked files (common right after bootstrapping IAS), but avoid switching branches if
+  # tracked files have changes (staged or unstaged).
+  local dirty tracked_dirty
+  dirty="$(git status --porcelain)"
+  tracked_dirty="$(printf "%s\n" "${dirty}" | grep -vE '^[?][?] ' || true)"
+  [[ -z "${tracked_dirty}" ]] || die "working tree has changes to tracked files; commit/stash first"
+
+  if [[ -z "${base}" ]]; then
+    base="$(detect_default_branch)"
+  fi
+
+  local ymd branch
+  ymd="$(today_ymd)"
+  if [[ -n "${name}" ]]; then
+    branch="${name}"
+  else
+    if [[ -z "${prefix}" ]]; then
+      prefix="ias/"
+    else
+      [[ "${prefix}" == */ ]] || prefix="${prefix}/"
+      if [[ "${prefix}" != "ias/" && "${prefix}" != */ias/ ]]; then
+        prefix="${prefix}ias/"
+      fi
+    fi
+    branch="${prefix}${ymd}-${slug}"
+  fi
+
+  git check-ref-format --branch "${branch}" >/dev/null 2>&1 || die "invalid branch name: ${branch}"
+
+  # Keep momentum: fetch failures (offline, bad remote) should not hard-stop branch creation.
+  local fetch_err=""
+  if ! fetch_err="$(git fetch --all --prune 2>&1)"; then
+    fetch_err="$(printf "%s\n" "${fetch_err}" | head -n 1 | tr -d '\r')"
+    ias_ui_warn "git fetch failed; continuing${fetch_err:+: ${fetch_err}}"
+  fi
+
+  if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    switch_to_base_branch "${base}"
+    if git remote get-url origin >/dev/null 2>&1; then
+      # Same as fetch: log-and-continue; a failed pull means the branch may not be up-to-date.
+      local pull_err=""
+      if ! pull_err="$(git pull --ff-only 2>&1)"; then
+        pull_err="$(printf "%s\n" "${pull_err}" | head -n 1 | tr -d '\r')"
+        ias_ui_warn "git pull --ff-only failed; continuing${pull_err:+: ${pull_err}}"
+      fi
+    fi
+  else
+    # Unborn repo (no commits yet): create the base branch if needed.
+    local cur
+    cur="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [[ -n "${cur}" && "${cur}" == "${base}" ]]; then
+      : # already on the desired base branch
+    elif git show-ref --verify --quiet "refs/heads/${base}"; then
+      git switch "${base}" >/dev/null 2>&1 || git checkout "${base}" >/dev/null 2>&1 || die "cannot switch to base branch: ${base}"
+    else
+      git switch -c "${base}" >/dev/null 2>&1 || git checkout -b "${base}" >/dev/null 2>&1 || die "cannot create base branch: ${base}"
+    fi
+  fi
+
+  if git show-ref --verify --quiet "refs/heads/${branch}"; then
+    git switch "${branch}" >/dev/null 2>&1 || git checkout "${branch}" >/dev/null 2>&1 || die "cannot switch to existing branch: ${branch}"
+    echo "Switched to existing branch: ${branch}"
+    return 0
+  fi
+
+  git switch -c "${branch}" >/dev/null 2>&1 || git checkout -b "${branch}" >/dev/null 2>&1 || die "cannot create branch: ${branch}"
+
+  echo "Switched to branch: ${branch}"
+}
+
+detect_default_branch() {
+  local origin_default=""
+  if git remote get-url origin >/dev/null 2>&1; then
+    origin_default="$(
+      git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null \
+        | sed 's|^origin/||' \
+        | tr -d '\r' \
+        | sed 's/[[:space:]]*$//'
+    )"
+  fi
+
+  if [[ -n "${origin_default}" ]]; then
+    echo "${origin_default}"
+    return 0
+  fi
+
+  if git show-ref --verify --quiet "refs/heads/main"; then
+    echo "main"
+    return 0
+  fi
+  if git show-ref --verify --quiet "refs/heads/master"; then
+    echo "master"
+    return 0
+  fi
+
+  local cur
+  cur="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -n "${cur}" && "${cur}" != "HEAD" ]]; then
+    echo "${cur}"
+    return 0
+  fi
+
+  echo "main"
+}
+
+switch_to_base_branch() {
+  local base="$1"
+  [[ -n "${base}" ]] || die "missing base branch"
+
+  if git show-ref --verify --quiet "refs/heads/${base}"; then
+    git switch "${base}" >/dev/null 2>&1 || git checkout "${base}" >/dev/null 2>&1 || die "cannot switch to base branch: ${base}"
+    return 0
+  fi
+
+  if git show-ref --verify --quiet "refs/remotes/origin/${base}"; then
+    git switch -c "${base}" "origin/${base}" >/dev/null 2>&1 \
+      || git checkout -b "${base}" "origin/${base}" >/dev/null 2>&1 \
+      || die "cannot create local base branch from origin: ${base}"
+    return 0
+  fi
+
+  # Recovery path (common in greenfield repos):
+  # bootstrap may have committed IAS onto the install branch without a real base branch existing yet.
+  # If we can identify an install branch, create the requested base branch from it and proceed.
+  local install_ref=""
+  if git show-ref --verify --quiet "refs/heads/ias/bootstrap"; then
+    install_ref="ias/bootstrap"
+  elif git show-ref --verify --quiet "refs/remotes/origin/ias/bootstrap"; then
+    install_ref="origin/ias/bootstrap"
+  else
+    local cur
+    cur="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [[ -n "${cur}" && "${cur}" == ias/bootstrap* ]]; then
+      install_ref="${cur}"
+    fi
+  fi
+
+  if [[ -n "${install_ref}" ]]; then
+    ias_ui_warn "base branch '${base}' not found; creating it from '${install_ref}'"
+    git switch -c "${base}" "${install_ref}" >/dev/null 2>&1 \
+      || git checkout -b "${base}" "${install_ref}" >/dev/null 2>&1 \
+      || die "cannot create base branch '${base}' from '${install_ref}'"
+    return 0
+  fi
+
+  # Recovery path (common after default-branch renames):
+  # Some repos still use master, others use main. If the operator requests the
+  # other one explicitly and it doesn't exist, create it from the current base.
+  local cur
+  cur="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [[ -n "${cur}" ]]; then
+    if [[ "${base}" == "main" && "${cur}" == "master" ]]; then
+      ias_ui_warn "base branch '${base}' not found; creating it from '${cur}'"
+      git switch -c "${base}" "${cur}" >/dev/null 2>&1 \
+        || git checkout -b "${base}" "${cur}" >/dev/null 2>&1 \
+        || die "cannot create base branch '${base}' from '${cur}'"
+      return 0
+    fi
+    if [[ "${base}" == "master" && "${cur}" == "main" ]]; then
+      ias_ui_warn "base branch '${base}' not found; creating it from '${cur}'"
+      git switch -c "${base}" "${cur}" >/dev/null 2>&1 \
+        || git checkout -b "${base}" "${cur}" >/dev/null 2>&1 \
+        || die "cannot create base branch '${base}' from '${cur}'"
+      return 0
+    fi
+  fi
+
+  die "cannot switch to base branch: ${base} (pass --base <branch> if needed)"
+}
+
+next_decision_seq() {
+  local ymd="$1"
+  local max="0"
+  local file
+  while IFS= read -r -d '' file; do
+    local base seq
+    base="$(basename "$file")"
+    seq="${base#${ymd}-}"
+    seq="${seq%%-*}"
+    [[ "$seq" =~ ^[0-9]{4}$ ]] || continue
+    if ((10#$seq > 10#$max)); then
+      max="$seq"
+    fi
+  done < <(find "${IAS_DIR}/decisions" -maxdepth 1 -type f -name "${ymd}-????-*.md" -print0 2>/dev/null || true)
+
+  printf "%04d" "$((10#$max + 1))"
+}
+
+find_existing_decision_for_slug() {
+  local short_slug="$1"
+  [[ -n "${short_slug}" ]] || return 0
+  # Return the newest matching decision file path, if any.
+  find "${IAS_DIR}/decisions" -maxdepth 1 -type f -name "20[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-????-${short_slug}.md" -print 2>/dev/null \
+    | sort | tail -n 1
+}
+
+cmd_new_decision() {
+  ensure_ias_scaffold
+
+  local short_slug="${1:-}"
+  local title="${2:-}"
+  local maybe_flag="${3:-}"
+
+  [[ -n "${short_slug}" ]] || die "missing decision slug"
+  [[ -n "${title}" ]] || die "missing decision title"
+  require_kebab "${short_slug}"
+
+  local merge_blocker="false"
+  if [[ "${maybe_flag:-}" == "--merge-blocker" ]]; then
+    merge_blocker="true"
+  elif [[ -n "${maybe_flag:-}" ]]; then
+    die "unknown flag: ${maybe_flag}"
+  fi
+
+  local ymd seq iso
+  ymd="$(today_ymd)"
+  seq="$(next_decision_seq "${ymd}")"
+  iso="$(today_iso)"
+
+  local existing
+  existing="$(find_existing_decision_for_slug "${short_slug}")"
+  if [[ -n "${existing}" ]]; then
+    # Idempotency: avoid failing jobs that retry decision creation. Keep the existing decision
+    # file and ensure the corresponding gap line exists.
+    add_gap_line "${title} (decision: docs/ias/decisions/$(basename "${existing}"))"
+    echo "Decision already exists; gap recorded."
+    echo "Existing:"
+    echo "  ${existing}"
+    return 0
+  fi
+
+  local decision_path="${IAS_DIR}/decisions/${ymd}-${seq}-${short_slug}.md"
+  [[ -e "${decision_path}" ]] && die "decision already exists: ${decision_path}"
+
+  local safe_title
+  safe_title="$(escape_sed_replacement "${title}")"
+
+  sed \
+    -e "s|<title>|${safe_title}|g" \
+    -e "s|YYYY-MM-DD|${iso}|g" \
+    -e "s|- merge_blocker: false|- merge_blocker: ${merge_blocker}|g" \
+    "${IAS_DIR}/templates/decision-record.md" >"${decision_path}"
+
+  if ! search_fixed "## Open gaps" "${IAS_DIR}/gaps.md" >/dev/null; then
+    die "docs/ias/gaps.md is missing '## Open gaps' section"
+  fi
+
+  local gap_line="- ${title} (decision: docs/ias/decisions/$(basename "${decision_path}"))"
+  add_gap_line "${title} (decision: docs/ias/decisions/$(basename "${decision_path}"))"
+  echo "Decision created and gap recorded."
+
+  echo "Created:"
+  echo "  ${decision_path}"
+}
+
+cmd_add_gap() {
+  ensure_ias_scaffold
+  local text="${1:-}"
+  [[ -n "${text}" ]] || die "missing gap text"
+  add_gap_line "${text}"
+  echo "Gap recorded."
+}
+
+cmd_bootstrap() {
+  local target="${1:-}"
+  shift || true
+
+  [[ -n "${target}" ]] || die "missing target repo path"
+
+  local profile="terminal"
+  local force="false"
+  local local_only="false"
+  local commit="false"
+  local push="false"
+  local open_pr="false"
+  local branch=""
+  local base_override=""
+  local pr_base=""
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --profile)
+        shift || true
+        [[ -n "${1:-}" ]] || die "missing value for --profile <terminal|hybrid|control-plane|full>"
+        profile="${1}"
+        ;;
+      --minimal) profile="terminal" ;;
+      --full) profile="full" ;;
+      --force) force="true" ;;
+      --local-only) local_only="true" ;;
+      --commit) commit="true" ;;
+      --push) push="true" ;;
+      --pr|--open-pr) open_pr="true"; commit="true"; push="true" ;;
+      --branch)
+        shift || true
+        [[ -n "${1:-}" ]] || die "missing value for --branch <name>"
+        branch="${1}"
+        ;;
+      --base)
+        shift || true
+        [[ -n "${1:-}" ]] || die "missing value for --base <branch>"
+        base_override="${1}"
+        ;;
+      --pr-base)
+        shift || true
+        [[ -n "${1:-}" ]] || die "missing value for --pr-base <branch>"
+        pr_base="${1}"
+        ;;
+      *) die "unknown flag: ${1}" ;;
+    esac
+    shift || true
+  done
+
+  ias_ui_section "Bootstrap"
+  ias_ui_info "Target: ${target}"
+  ias_ui_info "Profile: ${profile}  Mode: $([[ "${local_only}" == "true" ]] && echo "local-only" || echo "tracked")  Commit: ${commit}  Push: ${push}  PR: ${open_pr}"
+
+  [[ -d "${target}" ]] || die "target repo does not exist: ${target}"
+
+  local include_runner="false"
+  local include_worker="false"
+  local include_integrations="false"
+  local include_reference="false"
+  local include_plans="false"
+  local include_mcp="false"
+  local include_control_plane_skill="false"
+
+  case "${profile}" in
+    terminal)
+      ;;
+    hybrid)
+      include_runner="true"
+      ;;
+    control-plane)
+      include_worker="true"
+      include_control_plane_skill="true"
+      ;;
+    full)
+      include_runner="true"
+      include_worker="true"
+      include_integrations="true"
+      include_reference="true"
+      include_plans="true"
+      include_mcp="true"
+      include_control_plane_skill="true"
+      ;;
+    *)
+      die "unknown profile: ${profile} (expected: terminal|hybrid|control-plane|full)"
+      ;;
+  esac
+
+  local is_git="false"
+  if git -C "${target}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    is_git="true"
+  fi
+
+  detect_default_branch_in_target() {
+    local origin_default=""
+    if git -C "${target}" remote get-url origin >/dev/null 2>&1; then
+      origin_default="$(
+        git -C "${target}" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null \
+          | sed 's|^origin/||' \
+          | tr -d '\r' \
+          | sed 's/[[:space:]]*$//'
+      )"
+    fi
+    if [[ -n "${origin_default}" ]]; then
+      echo "${origin_default}"
+      return 0
+    fi
+    if git -C "${target}" show-ref --verify --quiet "refs/heads/main"; then
+      echo "main"
+      return 0
+    fi
+    if git -C "${target}" show-ref --verify --quiet "refs/heads/master"; then
+      echo "master"
+      return 0
+    fi
+    local cur
+    cur="$(git -C "${target}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -n "${cur}" && "${cur}" != "HEAD" ]]; then
+      echo "${cur}"
+      return 0
+    fi
+    echo "main"
+  }
+
+  local base_branch=""
+  if [[ -n "${base_override}" ]]; then
+    base_branch="${base_override}"
+  elif [[ "${is_git}" == "true" ]]; then
+    base_branch="$(detect_default_branch_in_target)"
+  fi
+
+  if [[ "${commit}" == "true" || "${push}" == "true" || "${open_pr}" == "true" ]]; then
+    [[ "${is_git}" == "true" ]] || die "target must be a git repo for --commit/--push/--pr"
+    local dirty
+    dirty="$(git -C "${target}" status --porcelain 2>/dev/null || true)"
+    if [[ -n "${dirty}" ]]; then
+      local untracked_lines=()
+      local tracked_lines=()
+      while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        if [[ "${line}" == "?? "* ]]; then
+          untracked_lines+=("${line}")
+        else
+          tracked_lines+=("${line}")
+        fi
+      done <<<"${dirty}"
+
+      if (( ${#tracked_lines[@]} > 0 )); then
+        echo "error: refusing to bootstrap with tracked/staged changes in target repo" >&2
+        echo "" >&2
+        echo "Git status (porcelain):" >&2
+        for l in "${tracked_lines[@]}"; do
+          echo "${l}" >&2
+        done
+        if (( ${#untracked_lines[@]} > 0 )); then
+          echo "" >&2
+          echo "Note: untracked files are allowed; bootstrap will proceed, but IAS-managed paths may overwrite overlaps:" >&2
+          for l in "${untracked_lines[@]}"; do
+            echo "${l}" >&2
+          done
+        fi
+        exit 1
+      fi
+
+      if (( ${#untracked_lines[@]} > 0 )); then
+        echo "note: untracked files detected; bootstrap will proceed. Review these before using --commit:" >&2
+        for l in "${untracked_lines[@]}"; do
+          echo "  ${l}" >&2
+        done
+      fi
+    fi
+
+    if [[ -z "${branch}" ]]; then
+      branch="ias/bootstrap"
+    fi
+
+    local base_ref=""
+    if [[ -n "${base_branch}" ]]; then
+      if git -C "${target}" remote get-url origin >/dev/null 2>&1; then
+        git -C "${target}" fetch --prune origin >/dev/null 2>&1 || true
+      fi
+      if git -C "${target}" show-ref --verify --quiet "refs/remotes/origin/${base_branch}"; then
+        base_ref="origin/${base_branch}"
+      elif git -C "${target}" show-ref --verify --quiet "refs/heads/${base_branch}"; then
+        base_ref="${base_branch}"
+      else
+        base_ref=""
+      fi
+    fi
+
+    # Git doesn't allow a branch "a/b/c" if a branch "a/b" already exists.
+    # Back-compat: older Console installs used "ias/bootstrap/<repoId>" which conflicts if "ias/bootstrap" exists.
+    if [[ "${branch}" == ias/bootstrap/* ]]; then
+      local parent="ias/bootstrap"
+      if git -C "${target}" show-ref --verify --quiet "refs/heads/${parent}"; then
+        local suffix="${branch#ias/bootstrap/}"
+        local rewritten="ias/bootstrap-${suffix}"
+        echo "note: rewriting install branch due to git ref namespace conflict: ${branch} -> ${rewritten}" >&2
+        branch="${rewritten}"
+      fi
+    fi
+
+    if [[ -n "${branch}" ]]; then
+      if git -C "${target}" show-ref --verify --quiet "refs/heads/${branch}"; then
+        git -C "${target}" checkout "${branch}" >/dev/null || die "cannot checkout install branch: ${branch}"
+      else
+        if [[ -n "${base_ref}" ]]; then
+          git -C "${target}" checkout -b "${branch}" "${base_ref}" >/dev/null || die "cannot create install branch: ${branch}"
+        else
+          git -C "${target}" checkout -b "${branch}" >/dev/null || die "cannot create install branch: ${branch}"
+        fi
+      fi
+    fi
+
+    if [[ -z "${pr_base}" ]]; then
+      pr_base="${base_branch}"
+    fi
+  fi
+
+  local target_docs="${target}/docs"
+  local target_ias="${target_docs}/ias"
+  local target_scripts="${target}/scripts"
+  local target_runner="${target_scripts}/ias-runner"
+  local target_worker="${target_scripts}/ias-worker"
+  local target_shared="${target_scripts}/ias-shared"
+  local target_agents="${target}/.agents"
+  local target_claude="${target}/.claude"
+  local target_codex="${target}/.codex"
+  local target_mcp="${target}/.mcp.json"
+
+  mkdir -p "${target_docs}"
+
+  if [[ -e "${target_ias}" && "${force}" != "true" ]]; then
+    # Upgrade/repair mode: if the target already looks like IAS, preserve artifacts and proceed.
+    if [[ -f "${target_ias}/project-context.md" ]]; then
+      echo "note: target already has docs/ias; treating bootstrap as an upgrade (preserving artifacts). Use --force to be explicit." >&2
+      force="true"
+    else
+      # Check if docs/ias/ only contains policy/ (pre-bootstrap artifact from update_git_policy job).
+      # In that case, treat it as a fresh bootstrap rather than an error.
+      local ias_contents
+      ias_contents="$(ls -A "${target_ias}" 2>/dev/null | grep -v '^policy$' || true)"
+      if [[ -z "${ias_contents}" ]]; then
+        echo "note: docs/ias contains only policy/ (pre-bootstrap artifact); proceeding with fresh bootstrap." >&2
+      else
+        die "target already has docs/ias (use --force to overwrite): ${target_ias}"
+      fi
+    fi
+  fi
+
+  # If upgrading an existing IAS install with --force, preserve project artifacts.
+  local preserve_dir=""
+  if [[ -e "${target_ias}" && "${force}" == "true" ]]; then
+    preserve_dir="$(mktemp -d "${TMPDIR:-/tmp}/ias-preserve.XXXXXX")"
+    mkdir -p "${preserve_dir}/docs/ias"
+    for path in "project-context.md" "gaps.md" "context" "decisions" "runs" "design"; do
+      if [[ -e "${target_ias}/${path}" ]]; then
+        mkdir -p "$(dirname "${preserve_dir}/docs/ias/${path}")"
+        cp -R "${target_ias}/${path}" "${preserve_dir}/docs/ias/" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  rm -rf "${target_ias}"
+  mkdir -p "${target_ias}"
+  local docs_excludes=(--exclude=".DS_Store")
+  if [[ "${include_integrations}" != "true" ]]; then
+    docs_excludes+=(--exclude="integrations/")
+  fi
+  if [[ "${include_reference}" != "true" ]]; then
+    docs_excludes+=(--exclude="reference/")
+  fi
+  if [[ "${include_plans}" != "true" ]]; then
+    docs_excludes+=(--exclude="plans/")
+  fi
+  sync_dir_excluding "${IAS_DIR}" "${target_ias}" "${docs_excludes[@]}"
+  find "${target_ias}" -name ".DS_Store" -delete 2>/dev/null || true
+
+  if [[ -n "${preserve_dir}" ]]; then
+    for path in "project-context.md" "gaps.md" "context" "decisions" "runs" "design"; do
+      if [[ -e "${preserve_dir}/docs/ias/${path}" ]]; then
+        rm -rf "${target_ias:?}/${path}"
+        cp -R "${preserve_dir}/docs/ias/${path}" "${target_ias}/" 2>/dev/null || true
+      fi
+    done
+    rm -rf "${preserve_dir}" || true
+  else
+    # Ensure new bootstrapped repos start with a blank/target-specific world model and base goal.
+    # (The IAS home repo may have its own filled-in goal; we must not copy that into clients/projects.)
+    if [[ -f "${IAS_DIR}/templates/project-context.md" ]]; then
+      cp "${IAS_DIR}/templates/project-context.md" "${target_ias}/project-context.md"
+    fi
+    if [[ -f "${IAS_DIR}/templates/context-base-goal.md" ]]; then
+      mkdir -p "${target_ias}/context"
+      cp "${IAS_DIR}/templates/context-base-goal.md" "${target_ias}/context/base-goal.md"
+    fi
+
+    # Reset project artifacts to a clean scaffold so the IAS home repo cannot contaminate new installs.
+    # (These files are safe to commit in client repos, but should be target-specific.)
+
+    # Context pack scaffold.
+    mkdir -p "${target_ias}/context"
+    cat >"${target_ias}/context/inputs.md" <<'EOF'
+# Inputs (links and references)
+
+List the source materials the run should consider.
+
+## External links
+
+- TODO
+
+## Internal docs
+
+- TODO
+
+## Notes
+
+- TODO
+EOF
+    cat >"${target_ias}/context/README.md" <<'EOF'
+# Context Pack (human-curated)
+
+This folder is the **single human-first step** before an IAS run. The goal is to provide the base context in an ordered, easy-to-consume way.
+
+IAS is repo-first: the codebase is context too. This folder exists to capture the context that is *not* naturally expressed by the codebase (goals, constraints, PRDs, links, client requirements, etc.).
+
+## How to use
+
+1) Put the **base goal** in `docs/ias/context/base-goal.md` (can be 1 line).
+2) Add any relevant documents as Markdown in this folder (or link to them from `docs/ias/context/inputs.md`).
+3) Keep it tidy; prefer links over copy/pasting large external docs.
+
+Agents should treat this folder as canonical input. They may append clarifications, but should not rewrite or erase original human-provided intent without creating a decision record.
+
+## Greenfield checklist
+
+- `base-goal.md`: what to build (outcome statement)
+- `inputs.md`: links to inspiration, competitors, constraints, brand, etc.
+- Optional: PRD / user stories / success metrics (can be brief)
+
+## Brownfield checklist
+
+- `base-goal.md`: what to change/achieve
+- `inputs.md`: client requirements, existing docs, tickets, architecture notes
+- Optional: “known pain points”, “known risks”, “what not to touch”
+EOF
+    find "${target_ias}/context" -mindepth 1 -maxdepth 1 \
+      ! -name "README.md" ! -name "base-goal.md" ! -name "inputs.md" \
+      -exec rm -rf {} + 2>/dev/null || true
+
+    # Gaps start empty.
+    cat >"${target_ias}/gaps.md" <<'EOF'
+# Gaps (open items)
+
+This file tracks anything that prevents a solution from being “production ready”, including pending human decisions.
+
+## How to use
+
+- Add a new entry whenever an agent proceeds with a placeholder/stub due to missing input.
+- Link to a decision record in `docs/ias/decisions/` when applicable.
+- Keep this list short by resolving items quickly; unresolved gaps should be explicit.
+
+## Open gaps
+
+- (none)
+EOF
+
+    # Decisions start empty (keep README).
+    mkdir -p "${target_ias}/decisions"
+    if [[ -f "${IAS_DIR}/decisions/README.md" ]]; then
+      cp "${IAS_DIR}/decisions/README.md" "${target_ias}/decisions/README.md"
+    else
+      cat >"${target_ias}/decisions/README.md" <<'EOF'
+# Decisions
+
+Decision records are stored here (including pending human decisions).
+
+- Filename convention: `YYYYMMDD-####-<kebab-slug>.md`
+- Create via: `./scripts/ias new-decision <kebab-slug> "<Title>"`
+EOF
+    fi
+    find "${target_ias}/decisions" -mindepth 1 -maxdepth 1 \
+      -type f -name "*.md" ! -name "README.md" \
+      -delete 2>/dev/null || true
+
+    # Runs start empty (keep README).
+    mkdir -p "${target_ias}/runs"
+    if [[ -f "${IAS_DIR}/runs/README.md" ]]; then
+      cp "${IAS_DIR}/runs/README.md" "${target_ias}/runs/README.md"
+    else
+      cat >"${target_ias}/runs/README.md" <<'EOF'
+# Run logs
+
+Optional per-run logs to make long-running, multi-agent work auditable.
+
+- Add new logs as `docs/ias/runs/YYYYMMDD-<short-name>.md`
+- Use `docs/ias/templates/run-log.md`
+- For substantial runs, store run artifacts in `docs/ias/runs/YYYYMMDD-<short-name>/`
+EOF
+    fi
+    find "${target_ias}/runs" -mindepth 1 -maxdepth 1 \
+      ! -name "README.md" \
+      -exec rm -rf {} + 2>/dev/null || true
+
+    # Design starts as a scaffold (README + local-only assets).
+    mkdir -p "${target_ias}/design/assets"
+    printf "*\n!.gitignore\n" >"${target_ias}/design/assets/.gitignore"
+    if [[ -f "${IAS_DIR}/design/README.md" ]]; then
+      cp "${IAS_DIR}/design/README.md" "${target_ias}/design/README.md"
+    else
+      cat >"${target_ias}/design/README.md" <<'EOF'
+# Design (repo-only)
+
+This folder contains the product’s design package in Markdown (no Figma required).
+
+Create/refresh these artifacts for greenfield, user-facing work:
+
+- `docs/ias/design/brief.md`
+- `docs/ias/design/system.md`
+- `docs/ias/design/flows.md`
+- `docs/ias/design/screens.md`
+
+Use `./scripts/ias init-design` to scaffold from templates.
+
+Screenshots (optional) can live under `docs/ias/design/assets/` for local review.
+EOF
+    fi
+    find "${target_ias}/design" -mindepth 1 -maxdepth 1 \
+      ! -name "README.md" ! -name "assets" \
+      -exec rm -rf {} + 2>/dev/null || true
+  fi
+
+  # Ensure required project artifact scaffolds exist even when preserving an older IAS install.
+  # (Newer preflight requires `docs/ias/context/inputs.md` to exist.)
+  if [[ ! -f "${target_ias}/context/inputs.md" ]]; then
+    mkdir -p "${target_ias}/context"
+    cat >"${target_ias}/context/inputs.md" <<'EOF'
+# Inputs (links and references)
+
+List the source materials the run should consider.
+
+## External links
+
+- TODO
+
+## Internal docs
+
+- TODO
+
+## Notes
+
+- TODO
+EOF
+  fi
+
+  mkdir -p "${target_scripts}"
+  if [[ -e "${target_scripts}/ias" && "${force}" != "true" ]]; then
+    ias_ui_info "${target_scripts}/ias already exists; not overwriting."
+  else
+    cp "${ROOT_DIR}/scripts/ias" "${target_scripts}/ias"
+    chmod +x "${target_scripts}/ias" || true
+  fi
+
+  if [[ -d "${ROOT_DIR}/.agents" ]]; then
+    if [[ -e "${target_agents}" && "${force}" != "true" ]]; then
+      ias_ui_info "${target_agents} already exists; not overwriting."
+    else
+      rm -rf "${target_agents}"
+      local agents_excludes=(--exclude=".DS_Store")
+      if [[ "${include_control_plane_skill}" != "true" ]]; then
+        agents_excludes+=(--exclude="skills/ias-control-plane/")
+      fi
+      sync_dir_excluding "${ROOT_DIR}/.agents" "${target_agents}" "${agents_excludes[@]}"
+      find "${target_agents}" -name ".DS_Store" -delete 2>/dev/null || true
+    fi
+  fi
+
+  if [[ -d "${ROOT_DIR}/.claude" ]]; then
+    if [[ -e "${target_claude}" && "${force}" != "true" ]]; then
+      ias_ui_info "${target_claude} already exists; not overwriting."
+    else
+      rm -rf "${target_claude}"
+      local claude_excludes=(--exclude=".DS_Store")
+      if [[ "${include_control_plane_skill}" != "true" ]]; then
+        claude_excludes+=(--exclude="skills/ias-control-plane/")
+      fi
+      sync_dir_excluding "${ROOT_DIR}/.claude" "${target_claude}" "${claude_excludes[@]}"
+      find "${target_claude}" -name ".DS_Store" -delete 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "${include_runner}" == "true" && -d "${ROOT_DIR}/scripts/ias-runner" ]]; then
+    if [[ -e "${target_runner}" && "${force}" != "true" ]]; then
+      ias_ui_info "${target_runner} already exists; not overwriting."
+    else
+      rm -rf "${target_runner}"
+      sync_dir_excluding "${ROOT_DIR}/scripts/ias-runner" "${target_runner}" --exclude=node_modules --exclude=".DS_Store"
+      find "${target_runner}" -name ".DS_Store" -delete 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "${include_worker}" == "true" && -d "${ROOT_DIR}/scripts/ias-worker" ]]; then
+    if [[ -e "${target_worker}" && "${force}" != "true" ]]; then
+      ias_ui_info "${target_worker} already exists; not overwriting."
+    else
+      rm -rf "${target_worker}"
+      sync_dir_excluding "${ROOT_DIR}/scripts/ias-worker" "${target_worker}" --exclude=node_modules --exclude=".DS_Store"
+      find "${target_worker}" -name ".DS_Store" -delete 2>/dev/null || true
+    fi
+  fi
+
+  if [[ ( "${include_runner}" == "true" || "${include_worker}" == "true" ) && -d "${ROOT_DIR}/scripts/ias-shared" ]]; then
+    if [[ -e "${target_shared}" && "${force}" != "true" ]]; then
+      ias_ui_info "${target_shared} already exists; not overwriting."
+    else
+      rm -rf "${target_shared}"
+      sync_dir_excluding "${ROOT_DIR}/scripts/ias-shared" "${target_shared}" --exclude=".DS_Store"
+      find "${target_shared}" -name ".DS_Store" -delete 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "${include_mcp}" == "true" && -f "${ROOT_DIR}/.mcp.json" ]]; then
+    if [[ -e "${target_mcp}" && "${force}" != "true" ]]; then
+      ias_ui_info "${target_mcp} already exists; not overwriting."
+    else
+      cp "${ROOT_DIR}/.mcp.json" "${target_mcp}"
+    fi
+  fi
+
+  # When upgrading with a narrower profile, remove previously installed optional components.
+  if [[ "${force}" == "true" ]]; then
+    if [[ "${include_runner}" != "true" && -d "${target_runner}" ]]; then
+      rm -rf "${target_runner}"
+    fi
+    if [[ "${include_worker}" != "true" && -d "${target_worker}" ]]; then
+      rm -rf "${target_worker}"
+    fi
+    if [[ "${include_runner}" != "true" && "${include_worker}" != "true" && -d "${target_shared}" ]]; then
+      rm -rf "${target_shared}"
+    fi
+    if [[ "${include_mcp}" != "true" && -f "${target_mcp}" ]]; then
+      rm -f "${target_mcp}"
+    fi
+    if [[ -e "${target_codex}" ]]; then
+      rm -rf "${target_codex}"
+    fi
+  fi
+
+  local agents_path="${target}/AGENTS.md"
+  local claude_path="${target}/CLAUDE.md"
+  local gitignore_path="${target}/.gitignore"
+
+  # Always ignore IAS local runtime state (locks, worker job overlays, caches).
+  # This should never be committed in any repo (client-safe or not).
+  if [[ ! -f "${gitignore_path}" ]]; then
+    : >"${gitignore_path}"
+  fi
+  if ! search_fixed ".DS_Store" "${gitignore_path}" >/dev/null; then
+    {
+      echo ""
+      echo "# macOS Finder metadata"
+      echo ".DS_Store"
+    } >>"${gitignore_path}"
+  fi
+  if ! search_fixed "/.ias/" "${gitignore_path}" >/dev/null; then
+    {
+      echo ""
+      echo "# IAS runtime state (local-only)"
+      echo "/.ias/"
+      echo "/.ias/**"
+    } >>"${gitignore_path}"
+  fi
+
+  # Repair: ensure IAS runtime state is never tracked. Older installs could accidentally commit `.ias/**`.
+  if git -C "${target}" ls-files -- ".ias" ".ias/**" 2>/dev/null | grep -q .; then
+    echo "note: removing tracked IAS runtime files (.ias/) from repo index" >&2
+    git -C "${target}" rm -r --cached --ignore-unmatch ".ias" >/dev/null 2>&1 || true
+  fi
+  # Always remove any leftover runtime state from the working tree (it is regenerated as needed).
+  rm -rf "${target}/.ias" 2>/dev/null || true
+
+  local agents_tpl="${ROOT_DIR}/templates/bootstrap/AGENTS.md"
+  if [[ -e "${agents_path}" && "${force}" != "true" ]]; then
+    ias_ui_info "${agents_path} already exists; not overwriting."
+  else
+    if [[ -f "${agents_tpl}" ]]; then
+      cp "${agents_tpl}" "${agents_path}"
+    else
+      cp "${ROOT_DIR}/AGENTS.md" "${agents_path}"
+    fi
+  fi
+
+  local claude_tpl="${ROOT_DIR}/templates/bootstrap/CLAUDE.md"
+  if [[ -e "${claude_path}" && "${force}" != "true" ]]; then
+    ias_ui_info "${claude_path} already exists; not overwriting."
+  else
+    if [[ -f "${claude_tpl}" ]]; then
+      cp "${claude_tpl}" "${claude_path}"
+    else
+      cp "${ROOT_DIR}/CLAUDE.md" "${claude_path}"
+    fi
+  fi
+
+  if [[ "${local_only}" == "true" ]]; then
+    # Avoid committing IAS IP into client repos: ignore the framework scaffolding by default.
+    # (Developers can still use it locally; it just won't be tracked by git.)
+    local marker="# IAS (framework local-only; keep project artifacts committable)"
+    if ! search_fixed "${marker}" "${gitignore_path}" >/dev/null; then
+      {
+        echo ""
+        echo "${marker}"
+        echo "# Ignore the generic framework (IP) but keep artifacts in-repo:"
+        echo "# - committed artifacts: docs/ias/{project-context.md,gaps.md,context/,decisions/,runs/,design/}"
+        echo "# - local-only framework: docs/ias/{process/,templates/,integrations/,reference/} + scripts/ias + .agents + .claude + legacy .codex cleanup + agent instruction files"
+        echo ""
+        echo "/scripts/ias"
+        echo "/scripts/ias-worker/"
+        echo "/scripts/ias-runner/"
+        echo "/scripts/ias-shared/"
+        echo "/AGENTS.md"
+        echo "/CLAUDE.md"
+        echo "/.agents/"
+        echo "/.claude/"
+        echo "/.codex/"
+        echo "/.mcp.json"
+        echo ""
+        echo "# IAS framework docs (local-only), but allowlist artifacts"
+        echo "/docs/ias/**"
+        echo "!/docs/ias/"
+        echo "!/docs/ias/project-context.md"
+        echo "!/docs/ias/gaps.md"
+        echo "!/docs/ias/context/"
+        echo "!/docs/ias/context/**"
+        echo "!/docs/ias/decisions/"
+        echo "!/docs/ias/decisions/**"
+        echo "!/docs/ias/runs/"
+        echo "!/docs/ias/runs/**"
+        echo ""
+        echo "# Runner telemetry (local-only by default; may contain framework prompts/logs)"
+        echo "/docs/ias/runs/**/runner/"
+        echo "/docs/ias/runs/**/runner/**"
+        echo "!/docs/ias/design/"
+        echo "!/docs/ias/design/**"
+      } >>"${gitignore_path}"
+    fi
+  fi
+
+  ias_ui_ok "Bootstrapped IAS docs into: ${target_ias}"
+  if [[ "${local_only}" == "true" ]]; then
+    ias_ui_info "Local-only mode enabled: added IAS paths to ${gitignore_path}"
+  fi
+
+  if [[ "${commit}" == "true" ]]; then
+    local stage_paths=(
+      "docs/ias"
+      "scripts/ias"
+      "scripts/ias-runner"
+      "scripts/ias-worker"
+      "scripts/ias-shared"
+      ".agents"
+      ".claude"
+      ".codex"
+      ".mcp.json"
+      "AGENTS.md"
+      "CLAUDE.md"
+      ".gitignore"
+    )
+	    local existing_stage_paths=()
+	    local p
+	    for p in "${stage_paths[@]}"; do
+	      if [[ -e "${target}/${p}" ]]; then
+	        existing_stage_paths+=("${p}")
+	        continue
+	      fi
+	      # Also stage tracked deletions (e.g. profile downgrades removing optional components).
+	      # `git ls-files -- <path>` returns tracked paths even when deleted from the working tree.
+	      if git -C "${target}" ls-files -- "${p}" 2>/dev/null | head -n 1 | grep -q '.'; then
+	        existing_stage_paths+=("${p}")
+	      fi
+	    done
+	    if (( ${#existing_stage_paths[@]} > 0 )); then
+	      git -C "${target}" add -A -- "${existing_stage_paths[@]}"
+	    fi
+    if git -C "${target}" diff --cached --quiet; then
+      ias_ui_info "No changes to commit."
+    else
+      git -C "${target}" commit -m "Bootstrap IAS framework" >/dev/null || die "git commit failed"
+      ias_ui_ok "Committed bootstrap changes on branch: $(git -C "${target}" rev-parse --abbrev-ref HEAD)"
+    fi
+  fi
+
+  if [[ "${push}" == "true" ]]; then
+    git -C "${target}" remote get-url origin >/dev/null 2>&1 || die "missing git remote 'origin' (required for --push/--pr)"
+    git -C "${target}" push -u origin HEAD >/dev/null || die "git push failed"
+    ias_ui_ok "Pushed branch to origin."
+  fi
+
+  if [[ "${open_pr}" == "true" ]]; then
+    have_cmd gh || die "GitHub CLI not found (install: https://cli.github.com/)"
+    [[ -n "${pr_base}" ]] || die "missing PR base branch (set --pr-base <branch> or run from a named branch)"
+
+    # If there are no commits between base and HEAD, `gh pr create --fill` fails (it can't infer title/body),
+    # and GitHub typically won't accept a PR with no diff anyway. Treat this as a no-op success so that
+    # higher-level automation (eg create_run) can still proceed and open a PR once it introduces changes.
+    local pr_base_ref="${pr_base}"
+    if git -C "${target}" show-ref --verify --quiet "refs/remotes/origin/${pr_base}"; then
+      pr_base_ref="origin/${pr_base}"
+    fi
+    local ahead_count="0"
+    ahead_count="$(git -C "${target}" rev-list --count "${pr_base_ref}..HEAD" 2>/dev/null || echo "0")"
+    if [[ "${ahead_count}" == "0" ]]; then
+      echo "note: no commits between ${pr_base_ref} and $(git -C "${target}" rev-parse --abbrev-ref HEAD); skipping PR creation."
+      return 0
+    fi
+
+    local pr_url=""
+    local pr_create_out=""
+    pr_create_out="$(
+      cd "${target}"
+      gh pr create --fill --base "${pr_base}" 2>&1
+    )" || true
+
+    # `gh pr create` exits non-zero if the PR already exists; treat that as success.
+    if [[ -n "${pr_create_out}" ]]; then
+      # Prefer a URL in the output (covers both success and "already exists" cases).
+      pr_url="$(echo "${pr_create_out}" | grep -Eo 'https?://[^[:space:]]+' | head -n 1 | tr -d '\r' | xargs || true)"
+    fi
+
+    if [[ -z "${pr_url}" ]]; then
+      pr_url="$(
+        cd "${target}"
+        gh pr view --json url --jq '.url' 2>/dev/null || true
+      )"
+      pr_url="$(echo "${pr_url}" | head -n 1 | tr -d '\r' | xargs)"
+    fi
+
+    if [[ -n "${pr_url}" ]]; then
+      if echo "${pr_create_out}" | grep -qi 'already exists'; then
+        echo "note: PR already exists: ${pr_url}"
+      else
+        echo "Opened PR: ${pr_url}"
+      fi
+    else
+      [[ -n "${pr_create_out}" ]] && echo "${pr_create_out}" >&2
+      die "failed to create PR via gh"
+    fi
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+
+  case "${cmd}" in
+    check) cmd_check "$@" ;;
+    check-runner) cmd_check_runner "$@" ;;
+    preflight) cmd_preflight "$@" ;;
+    init-context) cmd_init_context "$@" ;;
+    resume) cmd_resume "$@" ;;
+    inbox) cmd_inbox "$@" ;;
+    new-run) cmd_new_run "$@" ;;
+    new-decision) cmd_new_decision "$@" ;;
+    add-gap) cmd_add_gap "$@" ;;
+    init-design) cmd_init_design "$@" ;;
+    start-branch) cmd_start_branch "$@" ;;
+    bootstrap) cmd_bootstrap "$@" ;;
+    -h|--help|"") usage ;;
+    *) die "unknown command: ${cmd} (use --help)" ;;
+  esac
+}
+
+main "$@"
