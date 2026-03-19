@@ -4,7 +4,7 @@ Update this file at the start of any substantial run. It is the shared “world 
 
 ## Status
 
-- production: TODO
+- production: false
 - deployed_version_ref: n/a
 - engagement_type: greenfield
 - execution_mode: local-runtime-first (record any temporary framework-specific command path in notes)
@@ -13,7 +13,7 @@ Update this file at the start of any substantial run. It is the shared “world 
 
 - web_search: true
 - mcp_pack: none
-- mcp_budget_calls_per_task: 3
+- mcp_budget_calls_per_task: 0
 - preferred_mcp_servers:
   - (optional) perplexity
   - (optional) context7
